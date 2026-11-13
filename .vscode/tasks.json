@@ -1,0 +1,52 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Vanish: start relay + run app on emulator",
+      "dependsOn": ["Relay: start", "App: run on emulator"],
+      "dependsOrder": "parallel",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Relay: start",
+      "type": "shell",
+      "command": "bash scripts/start-relay.sh",
+      "windows": { "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start-relay.ps1" },
+      "isBackground": true,
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "App: run on emulator",
+      "type": "shell",
+      "command": "bash scripts/run-app.sh",
+      "windows": { "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-app.ps1" },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Relay: demo bot (fake classmate)",
+      "type": "shell",
+      "command": "relay/.venv/bin/python relay/demo_bot.py",
+      "windows": { "command": "relay\\.venv\\Scripts\\python.exe relay\\demo_bot.py" },
+      "presentation": { "panel": "dedicated", "reveal": "always" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Relay: run protocol tests",
+      "type": "shell",
+      "command": "python3 -m unittest test_relay -v",
+      "windows": { "command": "python -m unittest test_relay -v" },
+      "options": { "cwd": "${workspaceFolder}/relay" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Storage: check deleted messages",
+      "type": "shell",
+      "command": "python3 scripts/check_storage.py",
+      "windows": { "command": "python scripts/check_storage.py" },
+      "problemMatcher": []
+    }
+  ]
+}

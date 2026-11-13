@@ -1,0 +1,32 @@
+.venv/
+__pycache__/
+server.db
+*.db
+.gradle/
+.idea/
+build/
+local.properties
+*.iml
+.DS_Store
+local.properties
+app/.gradle/
+app/app/build/
+*.pyc
+# Additional security protections
+.env
+.env.*
+!.env.example
+secrets.properties
+*.jks
+*.keystore
+*.pem
+*.p12
+*.pfx
+
+# Generated Android packages
+*.apk
+*.aab
+
+# Logs and operating-system files
+*.log
+Thumbs.db

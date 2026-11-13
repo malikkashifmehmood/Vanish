@@ -1,0 +1,10 @@
+#!/bin/sh
+# Thin launcher. scripts/run-app.sh downloads gradle-wrapper.jar the first time.
+APP_HOME=$(cd "$(dirname "$0")" && pwd)
+JAR="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+if [ ! -f "$JAR" ]; then
+  echo "gradle-wrapper.jar is missing. Run scripts/run-app.sh once, or open this folder in Android Studio." >&2
+  exit 1
+fi
+if [ -n "$JAVA_HOME" ]; then JAVACMD="$JAVA_HOME/bin/java"; else JAVACMD=java; fi
+exec "$JAVACMD" -Xmx64m -Xms64m -Dorg.gradle.appname=gradlew -classpath "$JAR" org.gradle.wrapper.GradleWrapperMain "$@"
