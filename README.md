@@ -1,104 +1,241 @@
-# Vanish: 30-second disappearing class chat
 
-Android app (Kotlin, Jetpack Compose, Room, OkHttp WebSocket) plus a small Python relay for local testing. Built on the `field-sync` starter project (same pinned Gradle / Compose / Room versions).
+# Vanish — Disappearing Chat Application
 
-**Platform:** Android, minSdk 26, targetSdk 35.
+Vanish is an Android disappearing-chat application developed as a Mobile Application Development course project. It allows users to join a shared chat relay, exchange short messages, and automatically remove messages after their lifetime expires.
 
-**Relay address used:** `ws://10.0.2.2:8000/ws` on the emulator (your laptop's relay). On class day, type the class relay's address on the Join screen. It is saved, no rebuild needed.
+The application is built with Kotlin and Jetpack Compose. It uses Room for local message storage and WebSocket communication for real-time messaging.
 
-## Run it from VS Code (Windows, macOS or Linux)
+## Project information
 
-One-time needs: **Android Studio installed once** (it provides the SDK, emulator and a JDK) with **one virtual device** created in Device Manager, and **Python 3** for the relay.
+| Item | Details |
+|---|---|
+| Project | Vanish |
+| Platform | Android |
+| Language | Kotlin |
+| UI framework | Jetpack Compose |
+| Local database | Room |
+| Communication | WebSocket |
+| Message lifetime | 30 seconds |
+| Protocol | Version 1 (Sawaira's official class protocol) |
+| Shared relay | `wss://vanish-relay-sawaira.bonto.page/ws` |
 
-1. Open this folder (`vanish/`) in VS Code.
-2. Press **Ctrl+Shift+B** (task "Vanish: start relay + run app on emulator").
-   - One terminal starts the relay on port 8000.
-   - The other builds the app, starts your emulator if none is running, installs and opens Vanish.
-   - The first build downloads Gradle and libraries and takes several minutes.
-3. In the app: type a name, keep the default relay address, tap **Join**.
-4. Only one emulator? Run task **Relay: demo bot (fake classmate)**. It sends a message every 12 s.
+## Features
 
-Other tasks (Terminal > Run Task): *Relay: run protocol tests*, *Storage: check deleted messages*.
+- Join the shared class chat using a display name.
+- Send and receive messages in real time.
+- Automatically expire messages after 30 seconds.
+- Display a countdown for active messages.
+- Synchronize message timing using relay timestamps.
+- Store active messages locally using Room.
+- Queue outgoing messages while disconnected.
+- Drop queued messages that exceed the permitted 30-second age.
+- Reconnect automatically when the WebSocket connection is interrupted.
+- Detect duplicate message IDs to avoid repeated processing.
+- Display connection status and connection details.
+- Confirm before leaving a chat.
+- Handle optional relay-to-client Presence events and display a validated member list when such an event is received.
 
-Terminal equivalent: `bash scripts/start-relay.sh` and `bash scripts/run-app.sh`  
-(Windows: `powershell -ExecutionPolicy Bypass -File scripts\run-app.ps1`).
+**Presence limitation:** The Android application can process an optional Presence event, but live member information depends on the shared relay actually emitting that event. The app does not send Presence events, and no end-to-end Presence support is claimed unless the shared relay provides it.
 
-**Physical phone:** same Wi-Fi as the laptop, relay address `ws://<laptop-ip>:8000/ws` (the relay script prints it), allow port 8000 in the firewall, and USB debugging on for the installer.
+## Technology stack
 
-The relay listens on `0.0.0.0:8000` to accept local network connections. Use this setup only on a trusted network for the class demonstration. It is not a production-secure public relay.
+- **Kotlin:** Main application programming language.
+- **Jetpack Compose:** Android user interface.
+- **Material 3:** UI components and styling.
+- **Room:** Local database for active messages.
+- **OkHttp WebSocket:** Real-time communication with the relay.
+- **Kotlin Coroutines:** Asynchronous operations.
+- **Gradle:** Android build and dependency management.
 
-## What is where
+## Project structure
 
 ```text
-relay/    relay_core.py (protocol logic), main.py (FastAPI WebSocket), test_relay.py, demo_bot.py
-app/      Android project: data/ (Protocol, ChatRepository, Room, ServerClock), ui/ (Join, Chat)
-scripts/  run-app, start-relay, check_storage.py
-docs/     PROTOCOL.md <- read the note at the top
+vanish/
+├── app/
+│   ├── app/
+│   │   ├── src/
+│   │   │   ├── main/
+│   │   │   │   ├── java/com/example/vanish/
+│   │   │   │   │   ├── data/
+│   │   │   │   │   ├── ui/
+│   │   │   │   │   └── ...
+│   │   │   └── test/
+│   │   └── build.gradle.kts
+│   ├── build.gradle.kts
+│   ├── settings.gradle.kts
+│   └── gradlew.bat
+├── docs/
+│   ├── PROTOCOL.md
+│   ├── Design_Note.pdf
+│   └── Individual_Reflection.md
+└── README.md
 ```
 
-## How it meets the brief
+## Requirements
 
-| Requirement | Where |
-|---|---|
-| Countdown from relay `expires_at`, not the phone clock | `ServerClock.kt`, `ChatScreen.kt` (`expires_at - repo.now()`) |
-| Survives background, rotation, kill | Expiry is stored as an absolute time; state lives in `VanishApp`; sweep on start and every 0.5 s |
-| Offline queue, exactly once | `WAITING` rows, resent on reconnect with the same ID; relay and phone both ignore repeated IDs |
-| Real deletion, not hiding | Text overwritten, row deleted, `secure_delete` on, message text absent from the tested database, journal and WAL after expiry, `allowBackup=false` (`AppDatabase.kt`, `MessageDao.kt`) |
-| No replay of expired messages | Relay sends only live messages on reconnect; phone drops late arrivals and duplicates |
-| Lifecycle states | `Protocol.kt` `State`, diagram in `docs/PROTOCOL.md` |
+- Android Studio.
+- Android SDK.
+- JDK version compatible with the project's Gradle configuration.
+- An Android emulator or physical Android device.
+- Internet access to connect to the shared class relay.
+
+## Running the application
+
+### 1. Clone the repository
+
+```powershell
+git clone https://github.com/malikkashifmehmood/Vanish.git
+```
+
+### 2. Open the project
+
+Open the cloned `vanish` folder in Android Studio.
+
+Allow Android Studio to synchronize the Gradle project and download the required dependencies.
+
+### 3. Run the application
+
+Connect an Android device or start an emulator.
+
+Run the `app` configuration from Android Studio.
+
+The application uses the shared class relay by default:
+
+```text
+wss://vanish-relay-sawaira.bonto.page/ws
+```
+
+A public relay may take some time to respond if its hosting service is sleeping or starting up. Allow time for the initial connection.
+
+## Optional local development relay
+
+A separate local relay can be used for development and testing instead of the shared class relay.
+
+For an Android emulator, the local relay address is:
+
+```text
+ws://10.0.2.2:8000/ws
+```
+
+For a physical Android device, use the development computer's LAN IP address when both devices are connected to the same Wi-Fi network.
+
+The local relay is separate from the shared class relay. It is not required for normal use of the application with the shared relay.
+
+## Message lifecycle
+
+1. The user writes a message.
+2. The application saves the outgoing message locally.
+3. The application sends it to the relay when connected.
+4. The relay assigns the message timestamps.
+5. The relay broadcasts the message to joined clients.
+6. The application displays the message and its remaining lifetime.
+7. The message expires after 30 seconds.
+8. The application removes the expired message from its active local storage.
+
+The relay's timestamps are used for countdown synchronization so that the phone's wall clock does not determine message expiration.
+
+## Protocol
+
+Vanish implements version 1 of Sawaira's official class protocol.
+
+The protocol uses JSON messages over WebSocket connections.
+
+Principal protocol events include:
+
+| Direction | Event | Purpose |
+|---|---|---|
+| Client → Relay | `join` | Join the chat |
+| Relay → Client | `welcome` | Confirm the protocol and provide server time |
+| Client → Relay | `message` | Submit a chat message |
+| Relay → Clients | `message` | Broadcast a chat message |
+| Relay → Sender | `delivered` | Confirm message delivery |
+| Relay → Clients | `expired` | Announce message expiration |
+| Client → Relay | `ping` | Client heartbeat |
+| Relay → Client | `pong` | Relay heartbeat response |
+| Relay → Client | `error` | Report protocol or validation errors |
+
+### Optional Presence handling
+
+The Android application also handles an optional relay-to-client `presence` event containing a member count and member names.
+
+The client validates the event and preserves the supplied member order before displaying the member list.
+
+Presence is not a required Version 1 event. The application does not send it, and existing protocol behavior is unchanged. Live member information is available only if the shared class relay actually emits valid Presence events.
+
+The implementation uses:
+
+- A 30-second message lifetime.
+- Relay-assigned timestamps.
+- Heartbeats every 15 seconds.
+- A 30-second heartbeat timeout.
+- Exponential reconnection backoff of 1, 2, 4, and 8 seconds.
+- A maximum offline queue age of 30 seconds.
+
+For complete message formats, validation rules, lifecycle details, optional Presence handling, and error handling, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+## Testing
+
+The Android project includes automated tests for application behavior and related components.
+
+Run the following commands from the Gradle root directory (`app`):
+
+### Run unit tests
+
+```powershell
+.\gradlew.bat test
+```
+
+### Build the debug APK
+
+```powershell
+.\gradlew.bat :app:assembleDebug
+```
+
+### Run Android lint
+
+```powershell
+.\gradlew.bat :app:lintDebug
+```
+
+The generated debug APK is located at:
+
+```text
+app/app/build/outputs/apk/debug/app-debug.apk
+```
+
+## Security and privacy considerations
+
+Vanish is an educational disappearing-chat application. Its expiration features should not be interpreted as a guarantee of secure or permanent data erasure.
+
+Important limitations:
+
+- The shared class relay does not require a password.
+- Anyone who knows the shared relay address may attempt to connect.
+- The shared relay logs message text.
+- The application does not implement end-to-end encryption.
+- `wss://` protects communication in transit but does not prevent the relay from accessing message content.
+- Messages may be copied, photographed, captured in screenshots, or exposed through external device mechanisms.
+- Application-level deletion does not guarantee forensic erasure from physical storage, backups, or external copies.
+- Messages sent while disconnected are not guaranteed to be delivered after reconnection if they have expired.
+
+Users should not send confidential or sensitive information through the shared class relay.
+
+## Documentation
+
+Additional project documentation is available in the `docs` directory:
+
+- **[`docs/PROTOCOL.md`](docs/PROTOCOL.md)** — Version 1 of Sawaira's official class protocol, including message formats, timestamps, expiration, heartbeat, reconnection, optional Presence handling, and error handling.
+- **`docs/Design_Note.pdf`** — Project design, architecture, implementation details, testing, and security considerations.
+- **[`docs/Individual_Reflection.md`](docs/Individual_Reflection.md)** — Individual project reflection covering development work, testing, documentation, and lessons learned.
 
 ## Protocol status
 
-`docs/PROTOCOL.md` contains a reconstructed protocol based on the assignment requirements because no separate class-wide specification was provided.
+Vanish implements version 1 of Sawaira's official class protocol.
 
-It has not been confirmed as the class-approved protocol. Compare it with any protocol agreed upon by the class before claiming class-wide compatibility. If the class later agrees on different message fields, event names or timing rules, update the implementation to match that agreement.
+The Android application and shared relay must remain aligned with the official class specification. Optional client-side Presence handling does not change the protocol version or replace existing required events.
 
-## Demo checklist (Stage 3 to 5)
+## AI assistance disclosure
 
-- **Matching countdowns:** two emulators (or emulator + phone). Send a message, compare.
-- **Wrong phone clock:** emulator Settings > Date & time: switch off automatic time, set it 5 minutes off. The header shows `relay clock +/-300 s`, countdowns stay right.
-- **Offline send:** emulator airplane mode on, send, airplane mode off within 30 s: it arrives once. Wait more than 30 s offline: "Not sent" notice.
-- **Background / rotate / kill:** do each mid-countdown; nothing should survive past 0.
-- **Storage proof:** run `Storage: check deleted messages` with your text as argument while the message is visible (text FOUND), and again after it expired (rows 0, text not found).
+AI tools were used as development assistance during parts of the project, including support with code review, debugging, documentation, and explanations.
 
-## Testing and verification
-
-The following checks were performed during development:
-
-- Android debug build completed successfully.
-- Application installed and launched on the Pixel 6 Android emulator.
-- Android unit tests passed.
-- Relay tests: 11 passed.
-- Two-way messaging tested using the demo bot.
-- Offline queue and reconnection tested; the queued message was delivered once in the tested scenario.
-- Storage check after expiry showed zero message rows.
-- The tested message text was absent from the raw database, journal and WAL file bytes after expiry. A small WAL file still existed.
-- Android lint completed with zero errors and seven warnings.
-
-These results describe the tests performed; they do not guarantee that every possible device, network or failure scenario has been tested.
-
-## Honest limits (for your design note)
-
-Screenshots and photos of another phone, people copying the text, the relay's memory during the 30 s, a phone that is off when a message expires (it is deleted at next start, not at the moment of expiry), flash storage that may keep old blocks, and a rooted or modified app.
-
-The app can only promise to delete messages within its own functioning software and controlled storage. It cannot prevent every form of external capture or guarantee forensic erasure from physical storage.
-
-## Security considerations
-
-- The relay keeps active messages in memory and does not intentionally log or write message content to disk.
-- Message expiry is enforced by both the relay and the client.
-- Message IDs help prevent duplicate processing.
-- Android backup is disabled and backup exclusion rules are configured.
-- SQLite `secure_delete` is enabled.
-- The local development relay uses unencrypted `ws://` transport. This is suitable only for controlled local testing. A production deployment would require encrypted `wss://` transport, authentication and additional security controls.
-- The relay binds to `0.0.0.0:8000` for local network testing. Use it only on a trusted network and do not expose it as a public service.
-
-## AI assistance and acknowledgements
-
-The original code generation was attributed to Claude (Anthropic), using the assignment text and the `field-sync` starter project.
-
-ChatGPT was also used during subsequent debugging, security review, build and test verification, and documentation improvements.
-
-Libraries: Jetpack Compose, Room, OkHttp, kotlinx.coroutines, FastAPI and Uvicorn.
-
-All submitted code should be understood by the project team. The design note, test log and individual reflection should accurately describe each member's contribution.
+The project implementation, testing, and final review remain the responsibility of the project developer.

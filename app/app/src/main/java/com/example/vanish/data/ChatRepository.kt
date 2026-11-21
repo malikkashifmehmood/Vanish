@@ -1,3 +1,4 @@
+
 package com.example.vanish.data
 
 import android.content.Context
@@ -30,59 +31,96 @@ import java.util.concurrent.atomic.AtomicLong
 enum class Connection { OFFLINE, CONNECTING, ONLINE }
 
 /**
- * One instance per process (created in VanishApp), so the connection, the offline queue and the
- * expiry sweeper survive screen rotation and activity restarts.
+ * One instance per process (created in VanishApp).
  *
- * Message lifecycle (see docs/PROTOCOL.md):
- *   written -> WAITING -> SENT -> DELIVERED          (my messages)
- *   received -> DELIVERED -> DISPLAYED               (their messages)
- *   ... -> expired = row deleted;  WAITING too long or rejected -> DROPPED, then deleted
+ * Implements Sawaira's official Vanish Relay Protocol v1.
+ * Optional Presence events are received from the relay when supported.
+ *
+ * Message lifecycle:
+ *   written -> WAITING -> SENT -> DELIVERED
+ *   received -> DELIVERED -> DISPLAYED
+ *   expired = text wiped and row deleted
  */
 class ChatRepository(context: Context) {
+
     private val appContext = context.applicationContext
     val settings = Settings(appContext)
     val clock = ServerClock(settings.prefs)
+
     private val db = AppDatabase.build(appContext)
     private val dao = db.messageDao()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private val scope =
+        CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val http = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS)   // the heartbeat below detects dead connections
+        // The free public relay may take up to a minute to wake.
+        .connectTimeout(75, TimeUnit.SECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
     private val _name = MutableStateFlow(settings.name)
     val name: StateFlow<String?> = _name
-    private val _connection = MutableStateFlow(Connection.OFFLINE)
+
+    private val _connection =
+        MutableStateFlow(Connection.OFFLINE)
     val connection: StateFlow<Connection> = _connection
+
+    // Null means the relay has not supplied a Presence update
+    // for the current connection.
+    private val _onlineMembers =
+        MutableStateFlow<List<String>?>(null)
+    val onlineMembers: StateFlow<List<String>?> = _onlineMembers
+
     private val _notice = MutableStateFlow("")
     val notice: StateFlow<String> = _notice
 
     val messages: Flow<List<MessageEntity>> = dao.observeAll()
     val storedCount: Flow<Int> = dao.observeCount()
 
-    @Volatile private var socket: WebSocket? = null
-    @Volatile private var welcomed = false
-    @Volatile private var gotWelcome = false
-    @Volatile private var helloSentAt = 0L
-    @Volatile private var pingSentAt = 0L
+    @Volatile
+    private var socket: WebSocket? = null
+
+    @Volatile
+    private var welcomed = false
+
+    @Volatile
+    private var gotWelcome = false
+
+    @Volatile
+    private var joinSentAt = 0L
+
     private val nudge = Channel<Unit>(Channel.CONFLATED)
 
-    /** Relay time in ms. The UI computes every countdown from this and expires_at. */
+    /** Current estimated relay time in milliseconds. */
     fun now(): Long = clock.now()
 
-    // ------------------------------------------------------------------ public actions
+    // ------------------------------------------------------------
+    // Public actions
+    // ------------------------------------------------------------
 
-    /** Returns an error message, or null when joined. */
+    /** Returns an error message, or null when joining is requested. */
     fun join(name: String, relayUrl: String): String? {
         val n = name.trim()
-        if (n.length < 2 || n.length > Protocol.MAX_NAME) return "Name must be 2 to ${Protocol.MAX_NAME} characters"
+
+        if (n.length < 2 || n.length > Protocol.MAX_NAME) {
+            return "Name must be 2 to ${Protocol.MAX_NAME} characters"
+        }
+
         val url = relayUrl.trim()
-        if (!(url.startsWith("ws://") || url.startsWith("wss://"))) return "Relay address must start with ws:// or wss://"
+
+        if (!(url.startsWith("ws://") || url.startsWith("wss://"))) {
+            return "Relay address must start with ws:// or wss://"
+        }
+
         settings.relayUrl = url
         settings.name = n
         _name.value = n
-        socket?.cancel()          // restart the session with the new settings
+        _onlineMembers.value = null
+
+        socket?.cancel()
         nudge.trySend(Unit)
+
         return null
     }
 
@@ -90,52 +128,95 @@ class ChatRepository(context: Context) {
     fun leave() {
         settings.name = null
         _name.value = null
+        _onlineMembers.value = null
+
         socket?.cancel()
+
         scope.launch {
-            db.withTransaction { dao.wipeAll(); dao.deleteAll(); dao.deleteAllSeen() }
+            db.withTransaction {
+                dao.wipeAll()
+                dao.deleteAll()
+                dao.deleteAllSeen()
+            }
         }
     }
 
-    /** Write a message. It is stored as WAITING first, so it survives being offline or the app being killed. */
+    /** Store outgoing messages before attempting transmission. */
     fun send(text: String) {
         val sender = settings.name ?: return
         val t = text.trim().take(Protocol.MAX_TEXT)
+
         if (t.isEmpty()) return
+
         scope.launch {
-            val m = MessageEntity(
-                id = UUID.randomUUID().toString(), sender = sender, text = t,
-                sentAt = 0L, expiresAt = 0L, mine = true, state = State.WAITING,
+            val message = MessageEntity(
+                id = UUID.randomUUID().toString(),
+                sender = sender,
+                text = t,
+                sentAt = 0L,
+                expiresAt = 0L,
+                mine = true,
+                state = State.WAITING,
                 createdAt = System.currentTimeMillis()
             )
-            dao.insert(m)
+
+            dao.insert(message)
+
             val ws = socket
-            if (ws != null && welcomed) ws.send(Protocol.msg(m.id, sender, t))
+
+            if (ws != null && welcomed) {
+                ws.send(
+                    Protocol.message(
+                        message.id,
+                        sender,
+                        t
+                    )
+                )
+            }
         }
     }
 
     fun markDisplayed(id: String) {
-        scope.launch { dao.markDisplayed(id) }
+        scope.launch {
+            dao.markDisplayed(id)
+        }
     }
 
-    /** Called from Activity.onStart: delete anything that expired while we were away, and reconnect if needed. */
+    /** Called from Activity.onStart. */
     fun onForeground() {
-        scope.launch { sweepOnce() }
-        if (_connection.value != Connection.ONLINE) nudge.trySend(Unit)
+        scope.launch {
+            sweepOnce()
+        }
+
+        if (_connection.value != Connection.ONLINE) {
+            nudge.trySend(Unit)
+        }
     }
 
-    // ------------------------------------------------------------------ expiry sweeper
+    // ------------------------------------------------------------
+    // Expiry sweeper
+    // ------------------------------------------------------------
 
     private suspend fun sweepOnce() {
         val now = clock.now()
+
         db.withTransaction {
-            dao.wipeExpired(now)      // overwrite the text first ...
-            dao.deleteExpired(now)    // ... then delete the row
+            dao.wipeExpired(now)
+            dao.deleteExpired(now)
             dao.forgetOld(now)
         }
-        // A queued message that waited longer than its whole lifetime is never sent.
+
+        // An offline message older than its allowed queue lifetime
+        // is dropped and its content is wiped.
         val wall = System.currentTimeMillis()
-        for (m in dao.waiting()) {
-            if (wall - m.createdAt > Protocol.MAX_QUEUE_AGE_MS) dao.drop(m.id, now + Protocol.DROPPED_NOTICE_MS)
+
+        for (message in dao.waiting()) {
+            if (wall - message.createdAt > Protocol.MAX_QUEUE_AGE_MS) {
+                dao.drop(
+                    message.id,
+                    now + Protocol.DROPPED_NOTICE_MS
+                )
+            }
         }
     }
 
@@ -146,91 +227,176 @@ class ChatRepository(context: Context) {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                // never let one failed sweep stop the sweeper
+                // Keep the sweeper alive after an individual failure.
             }
+
             delay(500)
         }
     }
 
-    // ------------------------------------------------------------------ connection
+    // ------------------------------------------------------------
+    // Connection and reconnection
+    // ------------------------------------------------------------
 
     private suspend fun connectionLoop() {
         var backoff = 1_000L
+
         while (true) {
             val myName = settings.name
+
             if (myName == null) {
                 _connection.value = Connection.OFFLINE
+                _onlineMembers.value = null
                 delay(300)
                 continue
             }
-            val ok = try {
+
+            val successful = try {
                 runSession(myName)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 false
             }
+
             _connection.value = Connection.OFFLINE
-            backoff = if (ok) 1_000L else minOf(backoff * 2, 8_000L)
-            withTimeoutOrNull(backoff) { nudge.receive() }
+            _onlineMembers.value = null
+
+            if (successful) {
+                backoff = 1_000L
+            }
+
+            val retryDelay = backoff
+            backoff = minOf(backoff * 2, 8_000L)
+
+            withTimeoutOrNull(retryDelay) {
+                nudge.receive()
+            }
         }
     }
 
-    /** Runs one WebSocket session until it ends. Returns true if the relay welcomed us. */
-    private suspend fun runSession(myName: String): Boolean = coroutineScope {
+    /** Runs one WebSocket session until it closes. */
+    private suspend fun runSession(
+        myName: String
+    ): Boolean = coroutineScope {
+
         val request = try {
-            Request.Builder().url(settings.relayUrl).build()
+            Request.Builder()
+                .url(settings.relayUrl)
+                .build()
         } catch (e: IllegalArgumentException) {
             _notice.value = "Bad relay address"
             return@coroutineScope false
         }
+
         _connection.value = Connection.CONNECTING
+        _onlineMembers.value = null
+
         clock.newConnection()
         welcomed = false
         gotWelcome = false
 
         val closed = CompletableDeferred<Unit>()
-        val inbox = Channel<String>(Channel.UNLIMITED)   // keeps frames in order
-        val lastRx = AtomicLong(SystemClock.elapsedRealtime())
+        val inbox = Channel<String>(Channel.UNLIMITED)
 
-        val ws = http.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                helloSentAt = SystemClock.elapsedRealtime()
-                webSocket.send(Protocol.hello(settings.deviceId, myName))
-            }
+        val lastPong = AtomicLong(
+            SystemClock.elapsedRealtime()
+        )
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                lastRx.set(SystemClock.elapsedRealtime())
-                inbox.trySend(text)
-            }
+        val ws = http.newWebSocket(
+            request,
+            object : WebSocketListener() {
 
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null)
-            }
+                override fun onOpen(
+                    webSocket: WebSocket,
+                    response: Response
+                ) {
+                    joinSentAt = SystemClock.elapsedRealtime()
 
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                closed.complete(Unit)
-            }
+                    webSocket.send(
+                        Protocol.join(
+                            settings.deviceId,
+                            myName
+                        )
+                    )
+                }
 
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                closed.complete(Unit)
+                override fun onMessage(
+                    webSocket: WebSocket,
+                    text: String
+                ) {
+                    inbox.trySend(text)
+                }
+
+                override fun onClosing(
+                    webSocket: WebSocket,
+                    code: Int,
+                    reason: String
+                ) {
+                    webSocket.close(1000, null)
+                }
+
+                override fun onClosed(
+                    webSocket: WebSocket,
+                    code: Int,
+                    reason: String
+                ) {
+                    closed.complete(Unit)
+                }
+
+                override fun onFailure(
+                    webSocket: WebSocket,
+                    t: Throwable,
+                    response: Response?
+                ) {
+                    if (!welcomed) {
+                        _notice.value =
+                            "Relay connection failed: ${t.message ?: "connection error"}"
+                    }
+
+                    closed.complete(Unit)
+                }
             }
-        })
+        )
+
         socket = ws
 
-        val consumer = launch { for (frame in inbox) handleFrame(ws, frame) }
+        val consumer = launch {
+            for (frame in inbox) {
+                val type = try {
+                    JSONObject(frame).optString("type")
+                } catch (e: JSONException) {
+                    ""
+                }
+
+                // Reset the heartbeat timer when the relay welcomes
+                // this connection or responds to a ping.
+                if (type == "pong" || type == "welcome") {
+                    lastPong.set(SystemClock.elapsedRealtime())
+                }
+
+                handleFrame(ws, frame)
+            }
+        }
+
         val heartbeat = launch {
             while (true) {
                 delay(Protocol.HEARTBEAT_MS)
-                if (SystemClock.elapsedRealtime() - lastRx.get() > Protocol.HEARTBEAT_TIMEOUT_MS) {
-                    ws.cancel()                 // silent connection: treat as dead
+
+                if (!welcomed) {
+                    continue
+                }
+
+                val elapsed =
+                    SystemClock.elapsedRealtime() - lastPong.get()
+
+                if (elapsed >= Protocol.HEARTBEAT_TIMEOUT_MS) {
+                    ws.cancel()
                     closed.complete(Unit)
                     break
                 }
-                if (welcomed) {
-                    pingSentAt = SystemClock.elapsedRealtime()
-                    ws.send(Protocol.ping())
-                }
+
+                ws.send(Protocol.ping())
             }
         }
 
@@ -239,123 +405,282 @@ class ChatRepository(context: Context) {
         } finally {
             socket = null
             welcomed = false
+            _onlineMembers.value = null
+
             ws.cancel()
             inbox.close()
+
             consumer.cancel()
             heartbeat.cancel()
         }
+
         gotWelcome
     }
 
-    // ------------------------------------------------------------------ incoming frames
+    // ------------------------------------------------------------
+    // Incoming protocol frames
+    // ------------------------------------------------------------
 
-    private suspend fun handleFrame(ws: WebSocket, frame: String) {
-        val o = try {
+    private suspend fun handleFrame(
+        ws: WebSocket,
+        frame: String
+    ) {
+        val obj = try {
             JSONObject(frame)
         } catch (e: JSONException) {
             return
         }
-        when (o.optString("type")) {
-            "welcome" -> onWelcome(ws, o)
-            "pong" -> if (o.has("server_time")) {
-                clock.onSample(o.optLong("server_time"), pingSentAt, SystemClock.elapsedRealtime())
+
+        when (obj.optString("type")) {
+
+            "welcome" -> onWelcome(ws, obj)
+
+            // The class relay's pong contains no timestamp.
+            "pong" -> Unit
+
+            // The relay broadcasts complete messages to everyone,
+            // including the sender.
+            "message" -> onIncoming(obj)
+
+            // Optional relay-to-app event.
+            // Older relays that do not send Presence are unaffected.
+            "presence" -> onPresence(obj)
+
+            // This is a server notification to the sender.
+            "delivered" -> {
+                val id = obj.optString("id")
+                val count = obj.optInt("count")
+
+                // The sender is included in the count.
+                // At least two joined apps means another app
+                // received the broadcast.
+                if (id.isNotEmpty() && count >= 2) {
+                    dao.markMineDelivered(id)
+                }
             }
-            "msg" -> onIncoming(ws, o)
-            "ack" -> onAck(o)
-            "delivered" -> { dao.markMineDelivered(o.optString("id")) }
-            "expired" -> removeNow(o.optString("id"))
-            "error" -> onError(o)
+
+            "expired" -> removeNow(obj.optString("id"))
+
+            "error" -> onError(ws, obj)
         }
     }
 
-    private suspend fun onWelcome(ws: WebSocket, o: JSONObject) {
-        if (o.optInt("version") != Protocol.VERSION || !o.has("server_time")) {
-            _notice.value = "Relay protocol version ${o.optInt("version")} does not match this app (${Protocol.VERSION})"
+    /**
+     * Process optional Presence information from the relay.
+     *
+     * Presence is receive-only. This app never sends a Presence event.
+     * Invalid or inconsistent events are ignored without affecting chat.
+     */
+    private fun onPresence(obj: JSONObject) {
+        // Do not accept Presence before the relay welcomes this session.
+        if (!welcomed) return
+
+        // Accept only an actual JSON integer.
+        // Reject strings, decimals, missing values, and other types.
+        val count = obj.opt("count") as? Int ?: return
+
+        val membersArray = obj.optJSONArray("members") ?: return
+
+        val members = ArrayList<String>(membersArray.length())
+
+        for (index in 0 until membersArray.length()) {
+            val member = membersArray.opt(index) as? String ?: return
+            members.add(member)
+        }
+
+        val snapshot = PresenceSnapshot.create(
+            count = count,
+            members = members
+        ) ?: return
+
+        // Preserve the join order provided by the relay.
+        _onlineMembers.value = snapshot.members
+    }
+
+    private suspend fun onWelcome(
+        ws: WebSocket,
+        obj: JSONObject
+    ) {
+        val version = obj.optInt("protocol", -1)
+
+        if (version != Protocol.VERSION ||
+            !obj.has("server_time")
+        ) {
+            _notice.value =
+                "Relay protocol version $version does not match this app (${Protocol.VERSION})"
+
             ws.close(1000, null)
             return
         }
-        clock.onSample(o.optLong("server_time"), helloSentAt, SystemClock.elapsedRealtime())
+
+        clock.onSample(
+            obj.optLong("server_time"),
+            joinSentAt,
+            SystemClock.elapsedRealtime()
+        )
+
         gotWelcome = true
         welcomed = true
+
         _notice.value = ""
         _connection.value = Connection.ONLINE
-        pingSentAt = SystemClock.elapsedRealtime()
-        ws.send(Protocol.ping())          // a second clock sample right away
+
+        // Send the first heartbeat after successful welcome.
+        ws.send(Protocol.ping())
+
         flushQueue(ws)
     }
 
-    /** Send everything that waited offline, oldest first. The relay ignores a repeated id, so a retry is safe. */
+    /** Send queued messages oldest first. */
     private suspend fun flushQueue(ws: WebSocket) {
         val wall = System.currentTimeMillis()
         val now = clock.now()
-        for (m in dao.waiting()) {
-            if (wall - m.createdAt > Protocol.MAX_QUEUE_AGE_MS) {
-                dao.drop(m.id, now + Protocol.DROPPED_NOTICE_MS)
-            } else {
-                ws.send(Protocol.msg(m.id, m.sender, m.text))
-            }
-        }
-    }
 
-    private suspend fun onIncoming(ws: WebSocket, o: JSONObject) {
-        val id = o.optString("id")
-        val text = o.optString("text")
-        val expiresAt = o.optLong("expires_at")
-        if (id.isEmpty() || text.isEmpty() || expiresAt <= 0L) return
-
-        val now = clock.now()
-        val stored = db.withTransaction {
-            if (dao.seenCount(id) > 0 || dao.byId(id) != null) {
-                false                                   // duplicate id: ignored
+        for (message in dao.waiting()) {
+            if (wall - message.createdAt > Protocol.MAX_QUEUE_AGE_MS) {
+                dao.drop(
+                    message.id,
+                    now + Protocol.DROPPED_NOTICE_MS
+                )
             } else {
-                dao.markSeen(SeenId(id, expiresAt + Protocol.SEEN_GRACE_MS))
-                if (expiresAt <= now) {
-                    false                               // arrived already expired: remembered, never shown
-                } else {
-                    dao.insert(
-                        MessageEntity(
-                            id = id, sender = o.optString("sender"), text = text,
-                            sentAt = o.optLong("sent_at"), expiresAt = expiresAt,
-                            mine = false, state = State.DELIVERED,
-                            createdAt = System.currentTimeMillis()
-                        )
+                ws.send(
+                    Protocol.message(
+                        message.id,
+                        message.sender,
+                        message.text
                     )
-                    true
-                }
+                )
             }
         }
-        if (stored) ws.send(Protocol.delivered(id))
     }
 
-    private suspend fun onAck(o: JSONObject) {
-        val id = o.optString("id")
-        val expiresAt = o.optLong("expires_at")
-        if (id.isEmpty() || expiresAt <= 0L) return
-        if (expiresAt <= clock.now()) {
-            removeNow(id)                               // confirmed too late, it has already expired
+    /**
+     * Process the relay's broadcast message.
+     *
+     * For our own message, update the existing WAITING row using
+     * sent_at and expires_at.
+     *
+     * For another person's message, insert a new received row.
+     */
+    private suspend fun onIncoming(obj: JSONObject) {
+        val id = obj.optString("id")
+        val text = obj.optString("text")
+        val sender = obj.optString("sender")
+        val sentAt = obj.optLong("sent_at")
+        val expiresAt = obj.optLong("expires_at")
+
+        if (id.isEmpty() ||
+            text.isEmpty() ||
+            sentAt <= 0L ||
+            expiresAt <= 0L ||
+            expiresAt <= sentAt
+        ) {
             return
         }
-        dao.stamp(id, o.optLong("sent_at"), expiresAt)
-    }
 
-    private suspend fun onError(o: JSONObject) {
-        val id = o.optString("id")
-        when (val code = o.optString("code")) {
-            "invalid", "duplicate_id" -> if (id.isNotEmpty()) dao.drop(id, clock.now() + Protocol.DROPPED_NOTICE_MS)
-            "bad_version" -> _notice.value = "Relay rejected protocol version ${Protocol.VERSION}"
-            else -> _notice.value = "Relay error: $code"
+        val now = clock.now()
+
+        db.withTransaction {
+            val existing = dao.byId(id)
+
+            if (existing != null) {
+                // Our own message already exists as WAITING.
+                // The relay broadcast confirms its timestamps.
+                if (existing.mine) {
+                    if (expiresAt <= now) {
+                        dao.wipe(id)
+                        dao.deleteById(id)
+                    } else {
+                        dao.markSeen(
+                            SeenId(
+                                id,
+                                expiresAt + Protocol.SEEN_GRACE_MS
+                            )
+                        )
+
+                        dao.stamp(
+                            id,
+                            sentAt,
+                            expiresAt
+                        )
+                    }
+                }
+
+                // Existing received message: duplicate.
+                return@withTransaction
+            }
+
+            // Ignore a previously processed message ID.
+            if (dao.seenCount(id) > 0) {
+                return@withTransaction
+            }
+
+            dao.markSeen(
+                SeenId(
+                    id,
+                    expiresAt + Protocol.SEEN_GRACE_MS
+                )
+            )
+
+            if (expiresAt <= now) {
+                return@withTransaction
+            }
+
+            dao.insert(
+                MessageEntity(
+                    id = id,
+                    sender = sender,
+                    text = text,
+                    sentAt = sentAt,
+                    expiresAt = expiresAt,
+                    mine = false,
+                    state = State.DELIVERED,
+                    createdAt = System.currentTimeMillis()
+                )
+            )
         }
     }
 
-    /** The relay announced expiry (or the ack came too late): wipe the text, then delete the row. */
-    private suspend fun removeNow(id: String) {
-        if (id.isEmpty()) return
-        db.withTransaction { dao.wipe(id); dao.deleteById(id) }
+    private suspend fun onError(
+        ws: WebSocket,
+        obj: JSONObject
+    ) {
+        val code = obj.optString("code")
+        val message = obj.optString("message")
+
+        _notice.value = if (message.isNotBlank()) {
+            "Relay error: $message"
+        } else {
+            "Relay error: $code"
+        }
+
+        // Errors before welcome mean joining did not succeed.
+        if (!welcomed) {
+            ws.close(1000, null)
+        }
     }
 
+    /** Wipe message content before deleting its row. */
+    private suspend fun removeNow(id: String) {
+        if (id.isEmpty()) return
+
+        db.withTransaction {
+            dao.wipe(id)
+            dao.deleteById(id)
+        }
+    }
+
+    // ------------------------------------------------------------
+    // Initialization
+    // ------------------------------------------------------------
+
     init {
-        // Started last, after every property above exists.
-        scope.launch { sweeperLoop() }
-        scope.launch { connectionLoop() }
+        scope.launch {
+            sweeperLoop()
+        }
+
+        scope.launch {
+            connectionLoop()
+        }
     }
 }
